@@ -334,15 +334,7 @@ function createVchasnoPayload(data) {
     );
   }
 
-  const userinfo = {};
 
-  if (data.email) {
-    userinfo.email = String(data.email).trim();
-  }
-
-  if (data.phone) {
-    userinfo.phone = String(data.phone).trim();
-  }
 
   return {
     ver: 6,
@@ -350,7 +342,6 @@ function createVchasnoPayload(data) {
     device,
     tag: String(data.orderReference),
     type: 1,
-    userinfo,
 
     fiscal: {
       task: 1,
