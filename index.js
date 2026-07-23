@@ -2,16 +2,39 @@ import crypto from "node:crypto";
 import express from "express";
 
 const app = express();
+app.disable("x-powered-by");
 
 const PORT = Number(process.env.PORT) || 3000;
 
+/*
+|--------------------------------------------------------------------------
+| Налаштування
+|--------------------------------------------------------------------------
+*/
+
+// merchantAccount не є секретом, тому фіксуємо його прямо тут.
+const WAYFORPAY_MERCHANT_ACCOUNT = "artur_dron_webflow_io";
+
 const VCHASNO_API_URL =
+  process.env.VCHASNO_API_URL ||
   "https://kasa.vchasno.ua/api/v3/fiscal/execute";
+
+const VCHASNO_PAYMENT_TYPE = Number(
+  process.env.VCHASNO_PAYMENT_TYPE || 16
+);
+
+const VCHASNO_TAX_GROUP = Number(
+  process.env.VCHASNO_TAX_GROUP || 2
+);
 
 /*
 |--------------------------------------------------------------------------
-| Тимчасовий захист від повторної обробки в межах одного запуску сервера
+| Тимчасовий захист від дублів
 |--------------------------------------------------------------------------
+|
+| Працює до перезапуску Railway.
+| Для бойового використання потім підключимо PostgreSQL.
+|
 */
 
 const processedOrders = new Set();
@@ -23,11 +46,21 @@ const processingOrders = new Map();
 |--------------------------------------------------------------------------
 */
 
+function getRequiredEnv(name) {
+  const value = String(process.env[name] || "").trim();
+
+  if (!value) {
+    throw new Error(`У Railway відсутня змінна ${name}`);
+  }
+
+  return value;
+}
+
 function roundMoney(value) {
   const number = Number(value);
 
   if (!Number.isFinite(number)) {
-    throw new Error(`Некоректне числове значення: ${value}`);
+    throw new Error(`Некоректне число: ${value}`);
   }
 
   return Math.round((number + Number.EPSILON) * 100) / 100;
@@ -40,14 +73,14 @@ function createHmacMd5(value, secretKey) {
     .digest("hex");
 }
 
-function signaturesMatch(receivedSignature, expectedSignature) {
+function signaturesMatch(receivedValue, expectedValue) {
   const received = Buffer.from(
-    String(receivedSignature || "").toLowerCase(),
+    String(receivedValue || "").trim().toLowerCase(),
     "utf8"
   );
 
   const expected = Buffer.from(
-    String(expectedSignature || "").toLowerCase(),
+    String(expectedValue || "").trim().toLowerCase(),
     "utf8"
   );
 
@@ -56,6 +89,28 @@ function signaturesMatch(receivedSignature, expectedSignature) {
     crypto.timingSafeEqual(received, expected)
   );
 }
+
+function tryParseJson(value) {
+  if (!value) return null;
+
+  try {
+    const parsed = JSON.parse(value);
+
+    if (parsed && typeof parsed === "object") {
+      return parsed;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Розбір callback WayForPay
+|--------------------------------------------------------------------------
+*/
 
 function parseWayForPayBody(body) {
   const rawBody = Buffer.isBuffer(body)
@@ -66,37 +121,47 @@ function parseWayForPayBody(body) {
     throw new Error("WayForPay надіслав порожній callback");
   }
 
-  /*
-   * Основний варіант: WayForPay надсилає JSON,
-   * навіть якщо Content-Type визначений некоректно.
-   */
-  try {
-    return JSON.parse(rawBody);
-  } catch {
-    // Продовжуємо альтернативний розбір.
+  // Нормальний JSON.
+  const directJson = tryParseJson(rawBody);
+
+  if (directJson?.orderReference) {
+    return directJson;
   }
 
-  /*
-   * Запасний варіант: весь JSON міг бути переданий
-   * як ключ application/x-www-form-urlencoded.
-   */
+  // URL-encoded JSON.
+  try {
+    const decoded = decodeURIComponent(
+      rawBody.replace(/\+/g, "%20")
+    );
+
+    const decodedJson = tryParseJson(decoded);
+
+    if (decodedJson?.orderReference) {
+      return decodedJson;
+    }
+  } catch {
+    // Продовжуємо інші способи.
+  }
+
+  // Весь JSON міг потрапити як ключ form-urlencoded.
   const params = new URLSearchParams(rawBody);
 
   for (const [key, value] of params.entries()) {
     const candidates = [key, value];
 
     for (const candidate of candidates) {
-      if (!candidate) continue;
+      const parsed = tryParseJson(candidate);
+
+      if (parsed?.orderReference) {
+        return parsed;
+      }
 
       try {
-        const parsed = JSON.parse(candidate);
+        const decodedCandidate = decodeURIComponent(candidate);
+        const decodedParsed = tryParseJson(decodedCandidate);
 
-        if (
-          parsed &&
-          typeof parsed === "object" &&
-          parsed.orderReference
-        ) {
-          return parsed;
+        if (decodedParsed?.orderReference) {
+          return decodedParsed;
         }
       } catch {
         // Перевіряємо наступне значення.
@@ -105,77 +170,49 @@ function parseWayForPayBody(body) {
   }
 
   throw new Error(
-    `Не вдалося розібрати callback WayForPay: ${rawBody.slice(0, 300)}`
+    `Не вдалося розібрати callback: ${rawBody.slice(0, 250)}`
   );
 }
 
-function normalizeProducts(products) {
-  let value = products;
+/*
+|--------------------------------------------------------------------------
+| Перевірка WayForPay
+|--------------------------------------------------------------------------
+*/
 
-  if (typeof value === "string") {
-    try {
-      value = JSON.parse(value);
-    } catch {
-      throw new Error("Поле products містить некоректний JSON");
-    }
-  }
+function validateWayForPayCallback(data) {
+  const receivedMerchantAccount = String(
+    data.merchantAccount || ""
+  ).trim();
 
-  if (!Array.isArray(value) || value.length === 0) {
+  console.log("Перевірка merchantAccount:", {
+    received: receivedMerchantAccount,
+    expected: WAYFORPAY_MERCHANT_ACCOUNT,
+    equal:
+      receivedMerchantAccount === WAYFORPAY_MERCHANT_ACCOUNT
+  });
+
+  if (
+    receivedMerchantAccount !== WAYFORPAY_MERCHANT_ACCOUNT
+  ) {
     throw new Error(
-      "WayForPay не передав список товарів у полі products"
+      `Некоректний merchantAccount: ${receivedMerchantAccount}`
     );
   }
 
-  return value;
-}
-
-function createProductCode(orderReference, index) {
-  return crypto
-    .createHash("sha1")
-    .update(`${orderReference}:${index}`)
-    .digest("hex")
-    .slice(0, 16);
-}
-
-function validateEnvironment() {
-  const requiredVariables = [
-    "WAYFORPAY_MERCHANT_ACCOUNT",
-    "WAYFORPAY_SECRET_KEY",
-    "VCHASNO_TOKEN",
-    "VCHASNO_DEVICE"
-  ];
-
-  const missingVariables = requiredVariables.filter(
-    (variableName) => !process.env[variableName]
+  const secretKey = getRequiredEnv(
+    "WAYFORPAY_SECRET_KEY"
   );
-
-  if (missingVariables.length > 0) {
-    throw new Error(
-      `Відсутні Railway Variables: ${missingVariables.join(", ")}`
-    );
-  }
-}
-
-function validateWayForPaySignature(data) {
-  const merchantAccount =
-    process.env.WAYFORPAY_MERCHANT_ACCOUNT;
-
-  const secretKey =
-    process.env.WAYFORPAY_SECRET_KEY;
-
-  if (data.merchantAccount !== merchantAccount) {
-    throw new Error("Некоректний merchantAccount");
-  }
 
   const signatureString = [
-    data.merchantAccount,
-    data.orderReference,
-    data.amount,
-    data.currency,
-    data.authCode || "",
-    data.cardPan || "",
-    data.transactionStatus,
-    data.reasonCode
+    receivedMerchantAccount,
+    String(data.orderReference || ""),
+    String(data.amount ?? ""),
+    String(data.currency || ""),
+    String(data.authCode || ""),
+    String(data.cardPan || ""),
+    String(data.transactionStatus || ""),
+    String(data.reasonCode ?? "")
   ].join(";");
 
   const expectedSignature = createHmacMd5(
@@ -189,22 +226,66 @@ function validateWayForPaySignature(data) {
       expectedSignature
     )
   ) {
+    console.error("Підписи WayForPay не збігаються:", {
+      received: data.merchantSignature,
+      expected: expectedSignature,
+      signatureString
+    });
+
     throw new Error("Некоректний підпис WayForPay");
   }
+
+  console.log("Підпис WayForPay правильний");
 }
 
+/*
+|--------------------------------------------------------------------------
+| Товари
+|--------------------------------------------------------------------------
+*/
+
+function normalizeProducts(products) {
+  let normalizedProducts = products;
+
+  if (typeof normalizedProducts === "string") {
+    normalizedProducts = tryParseJson(normalizedProducts);
+  }
+
+  if (
+    !Array.isArray(normalizedProducts) ||
+    normalizedProducts.length === 0
+  ) {
+    throw new Error(
+      "WayForPay не передав список товарів"
+    );
+  }
+
+  return normalizedProducts;
+}
+
+function createProductCode(orderReference, index) {
+  return crypto
+    .createHash("sha1")
+    .update(`${orderReference}:${index}`)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Формування чека Вчасно.Каса
+|--------------------------------------------------------------------------
+*/
+
 function createVchasnoPayload(data) {
+  const device = getRequiredEnv("VCHASNO_DEVICE");
+
   const products = normalizeProducts(data.products);
-
-  const paymentType = Number(
-    process.env.VCHASNO_PAYMENT_TYPE || 16
-  );
-
-  const taxGroup = Number(
-    process.env.VCHASNO_TAX_GROUP || 2
-  );
-
   const paymentSum = roundMoney(data.amount);
+
+  if (paymentSum <= 0) {
+    throw new Error("Сума платежу повинна бути більшою за нуль");
+  }
 
   const rows = products.map((product, index) => {
     const name = String(product?.name || "").trim();
@@ -213,23 +294,21 @@ function createVchasnoPayload(data) {
 
     if (!name) {
       throw new Error(
-        `Не вказана назва товару №${index + 1}`
+        `Відсутня назва товару №${index + 1}`
       );
     }
 
     if (!Number.isFinite(count) || count <= 0) {
       throw new Error(
-        `Некоректна кількість товару "${name}"`
+        `Некоректна кількість товару: ${name}`
       );
     }
 
     if (price <= 0) {
       throw new Error(
-        `Некоректна ціна товару "${name}"`
+        `Некоректна ціна товару: ${name}`
       );
     }
-
-    const cost = roundMoney(price * count);
 
     return {
       code: createProductCode(
@@ -239,19 +318,19 @@ function createVchasnoPayload(data) {
       name,
       cnt: count,
       price,
-      cost,
+      cost: roundMoney(price * count),
       disc: 0,
-      taxgrp: taxGroup
+      taxgrp: VCHASNO_TAX_GROUP
     };
   });
 
   const productsSum = roundMoney(
-    rows.reduce((total, row) => total + row.cost, 0)
+    rows.reduce((sum, row) => sum + row.cost, 0)
   );
 
   if (Math.abs(productsSum - paymentSum) > 0.01) {
     throw new Error(
-      `Сума товарів ${productsSum} не дорівнює сумі оплати ${paymentSum}`
+      `Сума товарів ${productsSum} не дорівнює оплаті ${paymentSum}`
     );
   }
 
@@ -266,32 +345,23 @@ function createVchasnoPayload(data) {
   }
 
   return {
+    ver: 6,
     source: "WAYFORPAY",
-
-    // Фіскальний номер тестової або бойової каси.
-    device: String(process.env.VCHASNO_DEVICE),
-
-    // Унікальний номер замовлення.
+    device,
     tag: String(data.orderReference),
-
+    type: 1,
     userinfo,
 
     fiscal: {
-      // 1 — чек продажу.
       task: 1,
-
-      cashier:
-        process.env.VCHASNO_CASHIER || "WayForPay",
 
       receipt: {
         sum: paymentSum,
-
         rows,
 
         pays: [
           {
-            // 16 — Інтернет еквайринг.
-            type: paymentType,
+            type: VCHASNO_PAYMENT_TYPE,
             sum: paymentSum
           }
         ]
@@ -300,27 +370,26 @@ function createVchasnoPayload(data) {
   };
 }
 
+/*
+|--------------------------------------------------------------------------
+| Відправлення у Вчасно.Каса
+|--------------------------------------------------------------------------
+*/
+
 async function fiscalizeInVchasno(data) {
+  const token = getRequiredEnv("VCHASNO_TOKEN");
   const payload = createVchasnoPayload(data);
 
   console.log(
     "Надсилаємо чек у Вчасно.Каса:",
-    JSON.stringify(
-      {
-        orderReference: data.orderReference,
-        amount: data.amount,
-        products: data.products
-      },
-      null,
-      2
-    )
+    JSON.stringify(payload, null, 2)
   );
 
   const response = await fetch(VCHASNO_API_URL, {
     method: "POST",
 
     headers: {
-      Authorization: process.env.VCHASNO_TOKEN,
+      Authorization: token,
       "Content-Type": "application/json",
       Accept: "application/json"
     },
@@ -344,41 +413,33 @@ async function fiscalizeInVchasno(data) {
     };
   }
 
+  console.log("HTTP статус Вчасно:", response.status);
+
   console.log(
     "Відповідь Вчасно.Каса:",
     JSON.stringify(result, null, 2)
   );
 
-  const resultCode =
-    result.res === undefined
-      ? null
-      : Number(result.res);
-
-  const taskStatus =
-    result.task_status === undefined
-      ? null
-      : Number(result.task_status);
-
   if (!response.ok) {
     throw new Error(
-      `Вчасно.Каса HTTP ${response.status}: ${JSON.stringify(result)}`
+      `Вчасно HTTP ${response.status}: ${JSON.stringify(result)}`
     );
   }
 
   if (
-    resultCode !== null &&
-    resultCode !== 0
+    result.res !== undefined &&
+    Number(result.res) !== 0
   ) {
     throw new Error(
-      `Вчасно.Каса повернула помилку ${resultCode}: ${
+      `Вчасно res=${result.res}: ${
         result.errortxt || JSON.stringify(result)
       }`
     );
   }
 
-  if (taskStatus === 3) {
+  if (Number(result.task_status) === 3) {
     throw new Error(
-      `Помилка виконання завдання Вчасно.Каса: ${
+      `Вчасно відхилила чек: ${
         result.errortxt || JSON.stringify(result)
       }`
     );
@@ -387,30 +448,37 @@ async function fiscalizeInVchasno(data) {
   return result;
 }
 
+/*
+|--------------------------------------------------------------------------
+| Захист від одночасних повторів
+|--------------------------------------------------------------------------
+*/
+
 async function processApprovedPayment(data) {
   const orderReference = String(
     data.orderReference
-  );
+  ).trim();
 
   if (processedOrders.has(orderReference)) {
     console.log(
-      `Замовлення ${orderReference} вже було оброблене`
+      `Замовлення ${orderReference} уже оброблене`
     );
 
     return {
-      duplicate: true
+      duplicate: true,
+      orderReference
     };
   }
 
   if (processingOrders.has(orderReference)) {
     console.log(
-      `Замовлення ${orderReference} вже обробляється`
+      `Замовлення ${orderReference} уже обробляється`
     );
 
     return processingOrders.get(orderReference);
   }
 
-  const processingPromise = fiscalizeInVchasno(data)
+  const promise = fiscalizeInVchasno(data)
     .then((result) => {
       processedOrders.add(orderReference);
       return result;
@@ -419,27 +487,28 @@ async function processApprovedPayment(data) {
       processingOrders.delete(orderReference);
     });
 
-  processingOrders.set(
-    orderReference,
-    processingPromise
-  );
+  processingOrders.set(orderReference, promise);
 
-  return processingPromise;
+  return promise;
 }
 
-function createWayForPayResponse(orderReference) {
+/*
+|--------------------------------------------------------------------------
+| Відповідь WayForPay
+|--------------------------------------------------------------------------
+*/
+
+function createWayForPayAcceptResponse(orderReference) {
+  const secretKey = getRequiredEnv(
+    "WAYFORPAY_SECRET_KEY"
+  );
+
   const status = "accept";
   const time = Math.floor(Date.now() / 1000);
 
-  const signatureString = [
-    orderReference,
-    status,
-    time
-  ].join(";");
-
   const signature = createHmacMd5(
-    signatureString,
-    process.env.WAYFORPAY_SECRET_KEY
+    [orderReference, status, time].join(";"),
+    secretKey
   );
 
   return {
@@ -452,14 +521,25 @@ function createWayForPayResponse(orderReference) {
 
 /*
 |--------------------------------------------------------------------------
-| Перевірка роботи сервера
+| Перевірка сервера
 |--------------------------------------------------------------------------
 */
 
 app.get("/", (_req, res) => {
   res.json({
     status: "ok",
+    version: "vchasno-merchant-fix-3",
     service: "WayForPay → Вчасно.Каса",
+    merchantAccount: WAYFORPAY_MERCHANT_ACCOUNT,
+    wayforpaySecretConfigured: Boolean(
+      process.env.WAYFORPAY_SECRET_KEY
+    ),
+    vchasnoTokenConfigured: Boolean(
+      process.env.VCHASNO_TOKEN
+    ),
+    vchasnoDeviceConfigured: Boolean(
+      process.env.VCHASNO_DEVICE
+    ),
     timestamp: new Date().toISOString()
   });
 });
@@ -469,23 +549,22 @@ app.get("/", (_req, res) => {
 | Callback WayForPay
 |--------------------------------------------------------------------------
 |
-| Важливо: express.raw повинен стояти саме тут,
-| до express.json та express.urlencoded.
+| Цей маршрут обов’язково має бути ДО express.json().
 |
 */
 
 app.post(
   "/webhooks/wayforpay",
+
   express.raw({
     type: "*/*",
-    limit: "300kb"
+    limit: "500kb"
   }),
+
   async (req, res) => {
-    let data;
+    let data = null;
 
     try {
-      validateEnvironment();
-
       data = parseWayForPayBody(req.body);
 
       console.log(
@@ -508,32 +587,34 @@ app.post(
 
       if (!data.orderReference) {
         throw new Error(
-          "У callback відсутній orderReference"
+          "Відсутній orderReference"
         );
       }
 
-      validateWayForPaySignature(data);
+      validateWayForPayCallback(data);
 
       /*
-       * Неуспішні та проміжні статуси підтверджуємо,
-       * але чек для них не створюємо.
+       * Для неуспішних або проміжних статусів
+       * чек не створюємо.
        */
       if (
-        data.transactionStatus !== "Approved"
+        String(data.transactionStatus) !==
+        "Approved"
       ) {
         console.log(
           `Платіж ${data.orderReference}: ${data.transactionStatus}`
         );
 
         return res.json(
-          createWayForPayResponse(
+          createWayForPayAcceptResponse(
             data.orderReference
           )
         );
       }
 
       if (
-        String(data.currency).toUpperCase() !== "UAH"
+        String(data.currency || "").toUpperCase() !==
+        "UAH"
       ) {
         throw new Error(
           `Непідтримувана валюта: ${data.currency}`
@@ -549,7 +630,7 @@ app.post(
           {
             orderReference:
               data.orderReference,
-            result: fiscalResult
+            fiscalResult
           },
           null,
           2
@@ -557,28 +638,28 @@ app.post(
       );
 
       return res.json(
-        createWayForPayResponse(
+        createWayForPayAcceptResponse(
           data.orderReference
         )
       );
     } catch (error) {
-      console.error(
-        "Помилка обробки callback:",
+      const message =
         error instanceof Error
           ? error.message
-          : error
+          : String(error);
+
+      console.error(
+        "Помилка обробки callback:",
+        message
       );
 
       /*
-       * Не повертаємо accept, якщо чек не створено.
-       * WayForPay зможе повторити callback.
+       * Не віддаємо accept, якщо чек не створено.
+       * WayForPay повторить callback.
        */
       return res.status(502).json({
         status: "error",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Unknown error",
+        message,
         orderReference:
           data?.orderReference || null
       });
@@ -588,28 +669,22 @@ app.post(
 
 /*
 |--------------------------------------------------------------------------
-| Парсери для інших маршрутів
+| Інші маршрути
 |--------------------------------------------------------------------------
 */
 
 app.use(
   express.json({
-    limit: "300kb"
+    limit: "500kb"
   })
 );
 
 app.use(
   express.urlencoded({
     extended: false,
-    limit: "300kb"
+    limit: "500kb"
   })
 );
-
-/*
-|--------------------------------------------------------------------------
-| 404
-|--------------------------------------------------------------------------
-*/
 
 app.use((_req, res) => {
   res.status(404).json({
@@ -624,7 +699,21 @@ app.use((_req, res) => {
 */
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Сервер запущено на порту ${PORT}`
-  );
+  console.log(`Сервер запущено на порту ${PORT}`);
+
+  console.log("Конфігурація сервера:", {
+    merchantAccount: WAYFORPAY_MERCHANT_ACCOUNT,
+    wayforpaySecretConfigured: Boolean(
+      process.env.WAYFORPAY_SECRET_KEY
+    ),
+    vchasnoTokenConfigured: Boolean(
+      process.env.VCHASNO_TOKEN
+    ),
+    vchasnoDevice: String(
+      process.env.VCHASNO_DEVICE || "НЕ ЗАДАНО"
+    ),
+    paymentType: VCHASNO_PAYMENT_TYPE,
+    taxGroup: VCHASNO_TAX_GROUP,
+    vchasnoApiUrl: VCHASNO_API_URL
+  });
 });
