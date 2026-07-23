@@ -519,7 +519,7 @@ function createWayForPayAcceptResponse(orderReference) {
 app.get("/", (_req, res) => {
   res.json({
     status: "ok",
-    version: "vchasno-merchant-fix-3",
+    version: "vchasno-merchant-fix-4",
     service: "WayForPay → Вчасно.Каса",
     merchantAccount: WAYFORPAY_MERCHANT_ACCOUNT,
     wayforpaySecretConfigured: Boolean(
